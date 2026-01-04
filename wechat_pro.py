@@ -16,6 +16,10 @@ from dataclasses import dataclass, field
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 LOG_FILE = os.path.join(LOG_DIR, "wechat_pro.log")
 
+
+def _format_missing_message(missing: List[str]) -> str:
+    return f"缺少必要库: {', '.join(missing)}\n请运行: pip install {' '.join(missing)}"
+
 def _init_logger():
     if not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -51,7 +55,7 @@ def check_dependencies(exit_on_fail: bool = True) -> Tuple[bool, List[str]]:
         missing.append("pillow")
 
     if missing:
-        msg = f"缺少必要库: {', '.join(missing)}\n请运行: pip install {' '.join(missing)}"
+        msg = _format_missing_message(missing)
         logger.error(msg)
         print(msg, file=sys.stderr)
 
@@ -70,8 +74,11 @@ def check_dependencies(exit_on_fail: bool = True) -> Tuple[bool, List[str]]:
 
 EXIT_ON_DEP_FAIL = os.getenv("WECHAT_PRO_EXIT_ON_DEP_FAIL", "1") != "0"
 DEP_OK, DEP_MISSING = check_dependencies(exit_on_fail=EXIT_ON_DEP_FAIL)
-if EXIT_ON_DEP_FAIL and not DEP_OK:
-    sys.exit(1)
+if not DEP_OK:
+    missing_msg = _format_missing_message(DEP_MISSING)
+    if EXIT_ON_DEP_FAIL:
+        sys.exit(1)
+    raise ImportError(missing_msg)
 
 # 核心库导入
 import uiautomation as auto

@@ -7,28 +7,71 @@ import shutil
 import tempfile
 import ctypes
 import math
+import logging
+import platform
 from typing import Optional, List, Tuple, Dict
 from dataclasses import dataclass, field
 
 # === 依赖库检查与环境准备 ===
-def check_dependencies():
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+LOG_FILE = os.path.join(LOG_DIR, "wechat_pro.log")
+
+def _init_logger():
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR, exist_ok=True)
+
+    logger = logging.getLogger("wechat_pro")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    return logger
+
+logger = _init_logger()
+
+def check_dependencies(exit_on_fail: bool = True) -> Tuple[bool, List[str]]:
     missing = []
     try:
-        import uiautomation as auto
+        import uiautomation as auto  # noqa: F401
     except ImportError:
         missing.append("uiautomation")
-    
+
     try:
-        from PIL import Image
+        from PIL import Image  # noqa: F401
     except ImportError:
         missing.append("pillow")
-        
+
     if missing:
         msg = f"缺少必要库: {', '.join(missing)}\n请运行: pip install {' '.join(missing)}"
-        ctypes.windll.user32.MessageBoxW(0, msg, "环境缺失", 0x10)
-        sys.exit(1)
+        logger.error(msg)
+        print(msg, file=sys.stderr)
 
-check_dependencies()
+        if platform.system() == "Windows":
+            try:
+                ctypes.windll.user32.MessageBoxW(0, msg, "环境缺失", 0x10)
+            except Exception:
+                logger.debug("无法弹出 Windows 消息框，可能处于无图形环境")
+
+        if exit_on_fail:
+            return False, missing
+        return False, missing
+
+    logger.info("依赖检测通过：uiautomation、pillow 可用")
+    return True, []
+
+EXIT_ON_DEP_FAIL = os.getenv("WECHAT_PRO_EXIT_ON_DEP_FAIL", "1") != "0"
+DEP_OK, DEP_MISSING = check_dependencies(exit_on_fail=EXIT_ON_DEP_FAIL)
+if EXIT_ON_DEP_FAIL and not DEP_OK:
+    sys.exit(1)
 
 # 核心库导入
 import uiautomation as auto

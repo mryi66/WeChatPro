@@ -10,6 +10,8 @@
     <meta name="author" content="Mr.Lu Tech">
     <meta name="theme-color" content="#030308">
     <link rel="icon" type="image/x-icon" href="app.ico">
+    <!-- NOTE: 以绝对地址作为 GitHub Pages 备用图标，防止相对路径失效 -->
+    <link rel="shortcut icon" href="https://raw.githubusercontent.com/mryi66/WeChatPro/main/app.ico">
 
     <!-- Open Graph -->
     <meta property="og:title" content="WeChat Pro 2026 | Titan Edition">
@@ -737,9 +739,8 @@
         </div>
 
         <!-- 系统检测提示 -->
+        <!-- NOTE: 文字内容由 JS initSystemDetection() 动态写入，此处不写死 -->
         <div class="fade-in-up text-sm text-gray-500 font-mono mb-12" id="os-detect" style="animation-delay: 0.4s;">
-            <i class="fa-solid fa-check-circle text-[var(--neon-green)] mr-2"></i>
-            <span>检测到 Windows 环境，完美支持</span>
         </div>
 
         <!-- 统计数字 -->
@@ -1207,12 +1208,18 @@
             });
         }
 
-        // 2. 系统检测
+        // 2. 系统检测 - 动态更新提示文字并控制按钮状态
         function initSystemDetection() {
             const isWindows = navigator.userAgent.includes("Windows");
-            if (!isWindows && elements.downloadBtn) {
-                elements.downloadBtn.classList.add('grayscale', 'opacity-50');
-                elements.downloadBtn.style.pointerEvents = 'none';
+            const osDetect = document.getElementById('os-detect');
+            if (isWindows) {
+                osDetect.innerHTML = '<i class="fa-solid fa-check-circle text-[var(--neon-green)] mr-2"></i><span>检测到 Windows 环境，完美支持</span>';
+            } else {
+                osDetect.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-400 mr-2"></i><span>当前非 Windows 环境，程序仅支持 Windows 运行</span>';
+                if (elements.downloadBtn) {
+                    elements.downloadBtn.classList.add('grayscale', 'opacity-50');
+                    elements.downloadBtn.style.pointerEvents = 'none';
+                }
             }
         }
 

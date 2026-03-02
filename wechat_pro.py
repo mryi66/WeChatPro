@@ -11,6 +11,7 @@ import logging
 import sqlite3
 import re
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Optional, List, Tuple, Dict
 from dataclasses import dataclass, field
 
@@ -301,7 +302,9 @@ class MediaExtensions:
     """
     IMAGE = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
     VIDEO = {'.mp4', '.mov', '.avi', '.mkv', '.wmv'}
-    ALL = IMAGE | VIDEO
+    # NOTE: .txt 由名单解析器处理，不走附件通道，故不放入 DOCUMENT
+    DOCUMENT = {'.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.pdf', '.zip', '.rar'}
+    ALL = IMAGE | VIDEO | DOCUMENT
     
     @classmethod
     def get_filter(cls) -> str:
@@ -312,7 +315,8 @@ class MediaExtensions:
         """
         img = " ".join(f"*{ext}" for ext in cls.IMAGE)
         vid = " ".join(f"*{ext}" for ext in cls.VIDEO)
-        return f"媒体文件 ({img} {vid});;图片 ({img});;视频 ({vid});;所有文件 (*)"
+        doc = " ".join(f"*{ext}" for ext in cls.DOCUMENT)
+        return f"所有支持文件 ({img} {vid} {doc});;图片 ({img});;视频 ({vid});;文档 ({doc});;所有文件 (*)"
 
 # ==========================================
 # 1. 基础设施层 (Infrastructure)
@@ -432,81 +436,102 @@ class HistoryManager:
     
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
-            # 使用智能路径选择
             db_path = get_database_path()
         
         self.db_path = db_path
         self._init_db()
-        # 去重缓存：记录最近几秒内的发送，避免重复记录
         self._dedupe_cache = []
         self._dedupe_lock = threading.Lock()
-        self._dedupe_window = 10.0  # 去重时间窗口（秒）
-    
+        self._dedupe_window = 10.0
+
+    @contextmanager
+    def _db_conn(self):
+        """SQLite 连接上下文管理器
+
+        NOTE: 优化④：将重复的 connect/commit/close 三件套统一封装。
+        view_database_gui.py 有自己独立的连接逻辑，不使用此方法，不受影响。
+        timeout=10 防止并发写入时被锁死。
+
+        Yields:
+            sqlite3.Connection: 已连接的数据库对象
+        """
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def clear_dedupe_cache(self):
         """清空去重缓存，用于每次任务开始时"""
         with self._dedupe_lock:
             self._dedupe_cache = []
-    
+
     def _init_db(self):
         """初始化数据库表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS send_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                target TEXT NOT NULL,
-                content TEXT,
-                has_attachment INTEGER DEFAULT 0,
-                success INTEGER DEFAULT 1,
-                error_message TEXT
-            )
-        ''')
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_timestamp 
-            ON send_history(timestamp)
-        ''')
-        # 复合索引优化查询性能
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_target_timestamp
-            ON send_history(target, timestamp)
-        ''')
-        conn.commit()
-        conn.close()
-    
-    def record_send(self, target: str, content: str, 
-                    has_attachment: bool = False, 
-                    success: bool = True, 
-                    error_message: str = None):
+        with self._db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS send_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    target TEXT NOT NULL,
+                    content TEXT,
+                    has_attachment INTEGER DEFAULT 0,
+                    success INTEGER DEFAULT 1,
+                    error_message TEXT,
+                    attachment_info TEXT DEFAULT ''
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_timestamp 
+                ON send_history(timestamp)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_target_timestamp
+                ON send_history(target, timestamp)
+            ''')
+            # NOTE: 兼容旧数据库：如果 attachment_info 列不存在则添加
+            try:
+                cursor.execute('ALTER TABLE send_history ADD COLUMN attachment_info TEXT DEFAULT \'\'')
+            except Exception:
+                pass  # 列已存在则跳过)
+
+    def record_send(self, target: str, content: str,
+                    has_attachment: bool = False,
+                    success: bool = True,
+                    error_message: str = None,
+                    attachment_info: str = ''):
         """记录发送事件
-        
+
         Args:
             target: 目标名称
             content: 发送内容
             has_attachment: 是否包含附件
             success: 是否成功
             error_message: 错误信息
+            attachment_info: 附件类型描述，如“1张图片、1个文档”
         """
-        current_time = time.time()
-        
-        # 写入数据库
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO send_history 
-                (timestamp, target, content, has_attachment, success, error_message)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (current_time, target, content, int(has_attachment), int(success), error_message))
-            conn.commit()
-            conn.close()
-            logger.debug(f"✅ 记录已保存: target={target}, content_len={len(content) if content else 0}")
+            with self._db_conn() as conn:
+                conn.execute(
+                    '''
+                    INSERT INTO send_history 
+                    (timestamp, target, content, has_attachment, success, error_message, attachment_info)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (time.time(), target, content, int(has_attachment), int(success), error_message, attachment_info)
+                )
+            logger.debug(f"✅ 记录已保存: target={target}, content_len={len(content) if content else 0}, attachment_info={attachment_info}")
         except Exception as e:
             logger.error(f"❌ 记录保存失败: {e}")
-    
+
     def get_today_stats(self) -> Dict:
         """获取今日统计
-        
+
         Returns:
             包含今日发送量、成功率等统计信息的字典
         """
@@ -514,36 +539,24 @@ class HistoryManager:
         now = datetime.datetime.now()
         today_start = datetime.datetime(now.year, now.month, now.day)
         today_end = today_start + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
-        
         ts_start = today_start.timestamp()
         ts_end = today_end.timestamp()
-        
-        logger.debug(f"📊 统计查询: {today_start.strftime('%Y-%m-%d %H:%M:%S')} - {today_end.strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.debug(f"📊 时间戳范围: {ts_start} - {ts_end}")
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT COUNT(*), SUM(success), COUNT(DISTINCT target)
-            FROM send_history 
-            WHERE timestamp >= ? AND timestamp <= ?
-        ''', (ts_start, ts_end))
-        
-        row = cursor.fetchone()
-        
-        # 调试：查看原始数据
-        cursor.execute('SELECT COUNT(*) FROM send_history')
-        all_count = cursor.fetchone()[0]
+
+        logger.debug(f"📊 统计查询范围: {today_start.strftime('%Y-%m-%d')} 全天")
+
+        with self._db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT COUNT(*), SUM(success), COUNT(DISTINCT target) FROM send_history WHERE timestamp >= ? AND timestamp <= ?',
+                (ts_start, ts_end)
+            )
+            row = cursor.fetchone()
+            cursor.execute('SELECT COUNT(*) FROM send_history')
+            all_count = cursor.fetchone()[0]
+
         logger.debug(f"📊 数据库总记录数: {all_count}")
-        
-        conn.close()
-        
         total, success_count, unique_targets = row
         success_count = success_count or 0
-        
-        logger.debug(f"📊 今日统计结果: total={total}, success={success_count}, targets={unique_targets}")
-        
         return {
             'total': total or 0,
             'success': success_count,
@@ -551,55 +564,54 @@ class HistoryManager:
             'success_rate': (success_count / total * 100) if total else 0,
             'unique_targets': unique_targets or 0
         }
-    
+
     def get_history(self, limit: int = 100, offset: int = 0) -> List[Dict]:
         """获取历史记录
-        
+
         Args:
             limit: 返回记录数量限制
             offset: 偏移量
-            
+
         Returns:
             历史记录列表
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, timestamp, target, content, has_attachment, success, error_message
-            FROM send_history
-            ORDER BY timestamp DESC
-            LIMIT ? OFFSET ?
-        ''', (limit, offset))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
+        with self._db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT id, timestamp, target, content, has_attachment, success, error_message
+                FROM send_history
+                ORDER BY timestamp DESC
+                LIMIT ? OFFSET ?
+                ''',
+                (limit, offset)
+            )
+            rows = cursor.fetchall()
+
         return [
             {
-                'id': row[0],
-                'timestamp': row[1],
-                'time_str': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(row[1])),
-                'target': row[2],
-                'content': row[3],
-                'has_attachment': bool(row[4]),
-                'success': bool(row[5]),
-                'error_message': row[6]
+                'id': r[0],
+                'timestamp': r[1],
+                'time_str': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r[1])),
+                'target': r[2],
+                'content': r[3],
+                'has_attachment': bool(r[4]),
+                'success': bool(r[5]),
+                'error_message': r[6]
             }
-            for row in rows
+            for r in rows
         ]
-    
+
     def clear_old_records(self, days: int = 30):
         """清理旧记录
-        
+
         Args:
             days: 保留天数
         """
         cutoff = time.time() - days * 24 * 3600
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM send_history WHERE timestamp < ?', (cutoff,))
-        conn.commit()
-        conn.close()
+        with self._db_conn() as conn:
+            conn.execute('DELETE FROM send_history WHERE timestamp < ?', (cutoff,))
+        logger.debug(f"🗑️ 已清理 {days} 天以前的旧记录")
 
 class SemanticEngine(IStealthEngine):
     """智能语义隐形引擎
@@ -1161,7 +1173,9 @@ class AutomationWorker(QThread):
     def update_runtime_files(self, new_files: List[str]):
         with self._mutex:
             self.config.global_files = new_files
-            self.sig_log.emit(f"📂 附件列表已更新: 当前 {len(new_files)} 个文件")
+            # NOTE: 优化③：使用 FileHandler.format_file_summary 显示文件类型细节
+            summary = FileHandler.format_file_summary(new_files) if new_files else '0 个'
+            self.sig_log.emit(f"📂 附件列表已更新: {summary}")
             
     def update_runtime_params(self, new_count: int, new_interval: float):
         with self._mutex:
@@ -1336,10 +1350,13 @@ class AutomationWorker(QThread):
                             est_total = total_targets * current_limit
                             
                             if self.history_manager:
+                                # NOTE: 记录附件类型详情，供查看器展示
+                                attach_info = FileHandler.format_file_summary(active_files) if active_files else ''
                                 self.history_manager.record_send(
                                     target=name,
                                     content=active_msg[:100] if active_msg else "",
                                     has_attachment=bool(active_files),
+                                    attachment_info=attach_info,
                                     success=True
                                 )
                             
@@ -1483,11 +1500,54 @@ class FileHandler:
         10
     """
     
-    MEDIA_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', 
-                        '.mp4', '.mov', '.avi', '.mkv', '.wmv')
-    
+    # NOTE: 优化①：不再重复维护扩展名列表，直接引用 MediaExtensions.ALL，保持单一数据源
+    MEDIA_EXTENSIONS: tuple = tuple(MediaExtensions.ALL)
+
     def __init__(self):
         self.target_list: List[Tuple[str, str, List[str]]] = []
+
+    @staticmethod
+    def classify_files(files: List[str]) -> Dict[str, List[str]]:
+        """按文件类型分类文件列表
+
+        NOTE: 优化②：将重复的类型分类逻辑集中到此方法，
+        供 _open_media_dialog / dropEvent / update_runtime_files 统一调用。
+
+        Args:
+            files: 文件路径列表
+
+        Returns:
+            Dict，包含 'img' / 'vid' / 'doc' 三个键，值为对应文件路径列表
+        """
+        img_exts = tuple(MediaExtensions.IMAGE)
+        vid_exts = tuple(MediaExtensions.VIDEO)
+        result: Dict[str, List[str]] = {'img': [], 'vid': [], 'doc': []}
+        for f in files:
+            fl = f.lower()
+            if fl.endswith(img_exts):
+                result['img'].append(f)
+            elif fl.endswith(vid_exts):
+                result['vid'].append(f)
+            else:
+                result['doc'].append(f)
+        return result
+
+    @staticmethod
+    def format_file_summary(files: List[str]) -> str:
+        """将文件列表格式化为简短的类型摘要字符串，例如 '2 张图片、1 个文档'
+
+        Args:
+            files: 文件路径列表
+
+        Returns:
+            可读的摘要字符串
+        """
+        classified = FileHandler.classify_files(files)
+        parts = []
+        if classified['img']: parts.append(f"{len(classified['img'])} 张图片")
+        if classified['vid']: parts.append(f"{len(classified['vid'])} 个视频")
+        if classified['doc']: parts.append(f"{len(classified['doc'])} 个文档")
+        return '、'.join(parts) if parts else f"{len(files)} 个文件"
     
     def load_target_list(self, path: str) -> Tuple[bool, str, int]:
         """加载目标名单文件
@@ -2194,18 +2254,27 @@ class WeChatProUI(QMainWindow):
     def _open_media_dialog(self):
         img_exts = "*.png *.jpg *.jpeg *.gif *.bmp *.webp"
         vid_exts = "*.mp4 *.mov *.avi *.mkv *.wmv"
-        filters = f"媒体文件 ({img_exts} {vid_exts});;图片 ({img_exts});;视频 ({vid_exts});;所有文件 (*.*)"
-        
-        files, _ = QFileDialog.getOpenFileNames(self, "选择发送的图片或视频", "", filters)
+        # NOTE: 新增文档格式过滤器，使文件对话框能浏览并选中 Word/Excel/PDF 等文件
+        doc_exts = "*.doc *.docx *.xls *.xlsx *.ppt *.pptx *.pdf *.zip *.rar"
+        filters = (
+            f"所有支持文件 ({img_exts} {vid_exts} {doc_exts})"
+            f";;图片 ({img_exts})"
+            f";;视频 ({vid_exts})"
+            f";;文档/压缩包 ({doc_exts})"
+            f";;所有文件 (*.*)"
+        )
+
+        files, _ = QFileDialog.getOpenFileNames(self, "选择发送的文件（图片/视频/文档）", "", filters)
         if files:
-            count = 0
+            added = []
+            existing = {self.list_images.item(i).text() for i in range(self.list_images.count())}
             for f in files:
-                items = [self.list_images.item(i).text() for i in range(self.list_images.count())]
-                if f not in items:
+                if f not in existing:
                     self.list_images.addItem(f)
-                    count += 1
-            if count > 0:
-                self._log(f"📂 已手动添加 {count} 个媒体文件")
+                    added.append(f)
+            if added:
+                # NOTE: 优化②⑤：调用统一的 format_file_summary，批量完成后只刷新一次
+                self._log(f"📂 已添加 {FileHandler.format_file_summary(added)}")
                 self._on_files_changed()
 
     def _open_time_calculator(self):
@@ -2336,19 +2405,23 @@ class WeChatProUI(QMainWindow):
     def dropEvent(self, event):
         files = [u.toLocalFile() for u in event.mimeData().urls()]
         if not files: return
-        
+
         txt_files, media_files = FileHandler.filter_files(files)
-        
+
         if txt_files:
             self._load_file(txt_files[0])
-            if media_files: self._log(f"➕ 同时检测到媒体文件，已添加 {len(media_files)} 个")
-        
+
         if media_files:
+            existing = {self.list_images.item(i).text() for i in range(self.list_images.count())}
             for f in media_files:
-                items = [self.list_images.item(i).text() for i in range(self.list_images.count())]
-                if f not in items:
+                if f not in existing:
                     self.list_images.addItem(f)
-            self._log(f"🖼️ 已添加 {len(media_files)} 个图片/视频文件")
+            # NOTE: 优化②⑤：调用统一的 format_file_summary，批量完成后只刷新一次
+            summary = FileHandler.format_file_summary(media_files)
+            if txt_files:
+                self._log(f"📎 拖入：名单 1 份 + {summary}")
+            else:
+                self._log(f"📎 拖入文件：{summary}")
             self._on_files_changed()
 
     def _load_file_dialog(self):
